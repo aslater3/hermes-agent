@@ -227,6 +227,22 @@ def _run_identified(run_job, job, execution_id, **kwargs):
         exit_cron_execution(token)
 
 
+def _retire_empty_session(db, session_id):
+    row = db.get_session(session_id)
+    if row is not None and not row.get('message_count'):
+        db.end_session(session_id, 'cron_no_agent_run')
+        db.set_session_hidden(session_id, True)
+
+
+async def _retire_if_empty(authority, session_id):
+    """A pre-agent gate (monitor no_change, wakeAgent=false, blocked prompt) returns before the
+    agent writes a turn, leaving the row ``_create`` admitted empty, open and untitled in every
+    session list. End and hide it; the row itself stays so an exact retry still finds its admission."""
+    from functools import partial
+    from gateway.session_runtime_workers import tracked_write
+    await tracked_write(authority, partial(_retire_empty_session, authority.db, session_id))
+
+
 async def execute(authority, ref, row, policy):
     from cron.scheduler import run_job
     from gateway.run import _profile_runtime_scope
@@ -252,6 +268,7 @@ async def execute(authority, ref, row, policy):
         authority.pending_results[row['admission_id']] = {
             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
                        'failed': not result[0], 'completed': result[0]}, 'usage': {}}
+        await _retire_if_empty(authority, ref.session_id)
         if not result[0]:
             raise RuntimeError(result[3] or 'cron execution failed')
         return result[2]
