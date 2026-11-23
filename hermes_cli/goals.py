@@ -114,19 +114,18 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of four verdicts.\n\n"
+    "processes the agent has running. Decide one of five verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
     "DONE requires the deliverable to actually exist. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
     "DONE.\n\n"
-    "BLOCKED — the goal cannot be satisfied as stated:\n"
-    "- The response explains the goal is genuinely unachievable (impossible, "
-    "out of scope, no valid path to the deliverable), or refuses to "
-    "fabricate a deliverable that cannot exist, OR\n"
-    "- The response explains progress is blocked and the next step needs "
-    "user input to proceed.\n"
+    "BLOCKED — the goal cannot be satisfied as stated: the response explains "
+    "the goal is genuinely unachievable (impossible, out of scope, no valid "
+    "path to the deliverable), or refuses to fabricate a deliverable that "
+    "cannot exist. Do NOT use BLOCKED when the goal is still achievable and "
+    "the agent only needs something from the user — that is NEEDS_INPUT.\n"
     "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
     "a refusal, not a completion — never return BLOCKED for a goal that "
     "was achieved.\n"
@@ -136,6 +135,12 @@ JUDGE_SYSTEM_PROMPT = (
     "itself names. Never infer one the response does not name — an unnamed "
     "401 belongs to the model provider the agent was calling, not to some "
     "other service's token.\n\n"
+    "NEEDS_INPUT — the goal is still achievable, but the agent cannot take "
+    "the next step without the user: it asked the user a question, needs a "
+    "decision or approval, or needs a physical/manual action only the user "
+    "can do (e.g. power-cycle a device, sign in, plug something in). Return "
+    "the reason naming exactly what the user must provide. The loop pauses "
+    "and resumes automatically when the user replies.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -163,6 +168,7 @@ JUDGE_SYSTEM_PROMPT = (
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "blocked", "reason": "<one sentence>"}\n'
+    '{"verdict": "needs_input", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -188,7 +194,7 @@ JUDGE_USER_PROMPT_TEMPLATE = (
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Is the goal satisfied — done, blocked, continue, or wait?"
+    "Is the goal satisfied — done, blocked, needs_input, continue, or wait?"
 )
 
 # With /subgoal criteria: the judge must see ALL of them met, not just the original goal.
@@ -229,10 +235,13 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
     "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
-    "return BLOCKED with the reason describing the block.\n"
+    "the stated Stop condition, the goal is NOT done — return BLOCKED with "
+    "the reason describing the block.\n"
+    "- If the work is still achievable but the next step needs something "
+    "only the user can provide (an answer, a decision, a manual action), "
+    "return NEEDS_INPUT naming what the user must provide.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
-    "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
+    "Is the goal satisfied per its completion contract — done, blocked, needs_input, continue, or wait?"
 )
 
 # /goal draft: turn a plain objective into a reviewable contract (after Codex's "draft the goal").
@@ -425,9 +434,12 @@ class GoalState:
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
-    last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
+    last_verdict: Optional[str] = None        # "done" | "blocked" | "needs_input" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    # Set by a judge ``needs_input`` pause: the next real user message resumes the loop (without
+    # resetting the turn budget) instead of leaving it paused until an explicit /goal resume.
+    resume_on_user_message: bool = False
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -468,6 +480,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            resume_on_user_message=bool(data.get("resume_on_user_message")),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -795,6 +808,10 @@ def _extract_json_object(raw: str) -> Optional[dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+_VERDICT_ALIASES = {"needs-input": "needs_input", "needs input": "needs_input", "needsinput": "needs_input",
+                    "awaiting_input": "needs_input", "waiting_for_user": "needs_input"}
+
+
 def _parse_judge_response(raw: str) -> tuple[str, str, bool, Optional[dict[str, Any]]]:
     """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
 
@@ -817,7 +834,8 @@ def _parse_judge_response(raw: str) -> tuple[str, str, bool, Optional[dict[str, 
         done_val = data.get("done")
         done = done_val.strip().lower() in {"true", "yes", "1", "done"} if isinstance(done_val, str) else bool(done_val)
         verdict = "done" if done else "continue"
-    if verdict not in {"done", "blocked", "continue", "wait"}:
+    verdict = _VERDICT_ALIASES.get(verdict, verdict)
+    if verdict not in {"done", "blocked", "needs_input", "continue", "wait"}:
         verdict = "continue"
     if verdict != "wait":
         return verdict, reason, False, None
@@ -1160,9 +1178,10 @@ class GoalManager:
             raise RuntimeError("no active goal to park")
         return self._state
 
-    def _pause_state(self, reason: str) -> None:
+    def _pause_state(self, reason: str, *, resume_on_user_message: bool = False) -> None:
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.resume_on_user_message = resume_on_user_message
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
@@ -1192,6 +1211,7 @@ class GoalManager:
             return None
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.resume_on_user_message = False   # an explicit pause is never auto-lifted
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
@@ -1200,10 +1220,24 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.resume_on_user_message = False
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
+
+    def is_awaiting_input(self) -> bool:
+        s = self._state
+        return s is not None and s.status == "paused" and bool(s.resume_on_user_message)
+
+    def resume_after_user_input(self) -> bool:
+        """A real user message arrived: lift a judge ``needs_input`` pause so the judge grades the
+        turn that answered it. Keeps the turn budget (the user did not re-scope). No-op — returns
+        False — for any other pause (budget, user, unachievable, judge failures)."""
+        if not self.is_awaiting_input():
+            return False
+        self.resume(reset_budget=False)
+        return True
 
     def clear(self) -> None:
         if self._state is None:
@@ -1535,6 +1569,16 @@ class GoalManager:
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
             )
 
+        # NEEDS_INPUT: achievable, but only the user can supply the next step. Pause instead of
+        # re-poking (the agent would just repeat its question), and let the user's reply resume it.
+        if verdict == "needs_input":
+            self._pause_state(f"awaiting user input: {reason}", resume_on_user_message=True)
+            return _decision(
+                "paused", False, None, "needs_input", reason,
+                f"⏸ Goal waiting for your input: {reason} Reply and the goal resumes automatically "
+                f"({state.turns_used}/{state.max_turns} turns used).",
+            )
+
         if verdict == "done":
             state.status = "done"
             self._save()
@@ -1699,6 +1743,9 @@ def run_kanban_goal_loop(
             return _result("stopped", "judge transport failure")
         if verdict == "wait":
             verdict = "continue"
+        if verdict == "needs_input":
+            # A kanban worker has no user to answer it: block the card for human ops.
+            verdict, reason = "blocked", f"needs user input: {reason}"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "blocked":

@@ -817,6 +817,22 @@ def _lock_in_submit_turn(
 from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
+def _resume_goal_awaiting_input(sid: str, session: dict) -> None:
+    """A typed prompt answers a judge ``needs_input`` pause: resume the goal (keeping its turn
+    budget) so the post-turn judge grades the reply instead of the loop staying paused forever."""
+    key = str(session.get("session_key") or "")
+    if not key:
+        return
+
+    try:
+        # One small state_meta read; it must land before the turn's post-turn judge runs.
+        from hermes_cli.goals import GoalManager
+        if GoalManager(session_id=key).resume_after_user_input():
+            _emit("status.update", sid, {"kind": "goal", "text": "▶ Goal resumed after your reply."})
+    except Exception:  # health: allow BLE001 -- best-effort; the goal just stays paused
+        logger.debug("goal resume-after-input failed for %s", sid, exc_info=True)
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -919,6 +935,9 @@ def _(rid, params: dict) -> dict:
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
     if err is not None:
         return err
+    if display_kind is None and not internal_hosted_submit:
+        # Admitted typed reply: lift a judge needs_input pause (never for goal/loop/heartbeat turns).
+        _resume_goal_awaiting_input(sid, session)
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",

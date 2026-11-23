@@ -74,6 +74,8 @@ def _safe_goal_snapshot(state) -> dict | None:
         snapshot["updated_at"] = state.last_turn_at
     if state.paused_reason:
         snapshot["paused_reason"] = state.paused_reason
+    if state.status == "paused" and getattr(state, "resume_on_user_message", False):
+        snapshot["awaiting_input"] = True   # the next typed reply resumes it
     if state.last_verdict:
         snapshot["last_verdict"] = state.last_verdict
     if state.last_reason:

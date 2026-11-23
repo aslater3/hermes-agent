@@ -355,6 +355,31 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
+    @staticmethod
+    def _is_real_user_turn(event: Any) -> bool:
+        """A turn the user typed: not a goal/loop/heartbeat/process wake (those carry a display kind)."""
+        if event is None:
+            return False
+        from gateway.response_filters import display_kind_for_event
+        try:
+            return display_kind_for_event(event) is None
+        except Exception:  # health: allow BLE001 -- unknown provenance is never treated as user input
+            return False
+
+    async def _resume_goal_after_user_input(self, session_entry: Any, source: Any) -> None:
+        """The user answered a judge ``needs_input`` pause: resume the goal (keeping its budget) so the
+        goal-continuation hook that runs next judges the turn that answered it."""
+        def _load():
+            from hermes_cli.goals import GoalManager
+            max_turns = self._goal_max_turns_from_config()
+            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
+
+        mgr = await self._post_turn_manager(session_entry, "goal resume", "goals", _load)
+        if mgr is None or not mgr.is_awaiting_input():
+            return
+        if await asyncio.to_thread(mgr.resume_after_user_input) and source is not None:
+            await self._defer_goal_status_notice_after_delivery(source, "▶ Goal resumed after your reply.")
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
@@ -379,6 +404,11 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion)]
         if final_text.strip() and not failed:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
+            if self._is_real_user_turn(event):
+                try:
+                    await self._resume_goal_after_user_input(session_entry, source)
+                except Exception as exc:  # health: allow BLE001 -- best-effort; the goal just stays paused
+                    logger.debug("goal resume-after-input failed: %s", exc)
         for label, hook in hooks:
             try:
                 await hook(session_entry=session_entry, source=source, final_response="" if failed else final_text)
